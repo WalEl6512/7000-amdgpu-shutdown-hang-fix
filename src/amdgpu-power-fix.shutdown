@@ -1,0 +1,62 @@
+#!/bin/bash
+# amdgpu-power-fix — systemd-shutdown hook
+#
+# Runs as the very last userspace step before the kernel powers the machine off
+# (installed to /usr/lib/systemd/system-shutdown/). After heavy GPU use, an RX 7900
+# (Navi 31) can leave the system hanging at power-off with the fans still spinning.
+# This puts the GPU back into the state a reboot leaves it in, before the kernel's
+# own power-off path touches it:
+#   1. force the lowest DPM clocks and let the GPU go idle
+#   2. unbind the HDMI/DP audio function and the GPU from their drivers
+#   3. secondary-bus-reset the GPU (the same reset it gets on a reboot)
+#
+# systemd passes the action as $1: poweroff | halt | reboot | kexec.
+# Reboots are left alone, because they already work.
+
+case "$1" in poweroff|halt) ;; *) exit 0 ;; esac
+
+# Defaults; can be overridden in /etc/amdgpu-power-fix.conf
+QUIESCE_ON_POWEROFF=1
+UNBIND_ON_POWEROFF=1
+RESET_ON_POWEROFF=1
+VERBOSE=0
+[ -r /etc/amdgpu-power-fix.conf ] && . /etc/amdgpu-power-fix.conf
+
+# The journal is already stopped here, so write straight to the kernel log and the console.
+log() {
+    echo "amdgpu-power-fix: $*" > /dev/kmsg 2>/dev/null
+    echo "amdgpu-power-fix: $*" > /dev/console 2>/dev/null
+    [ "$VERBOSE" = 1 ] && sleep 2
+}
+
+log "hook started ($1)"
+for dev in /sys/bus/pci/drivers/amdgpu/0000:*; do
+    [ -e "$dev/power_dpm_force_performance_level" ] || continue
+    bdf=${dev##*/}
+    pdev=/sys/bus/pci/devices/$bdf
+    audio_bdf=${bdf%.*}.1
+
+    if [ "$QUIESCE_ON_POWEROFF" = 1 ]; then
+        echo low > "$dev/power_dpm_force_performance_level" 2>/dev/null && log "$bdf dpm forced low"
+        for _ in 1 2 3 4 5 6; do          # wait up to 3s for the GPU to go idle
+            [ "$(cat "$dev/gpu_busy_percent" 2>/dev/null)" = 0 ] && break
+            sleep 0.5
+        done
+    fi
+
+    if [ "$UNBIND_ON_POWEROFF" = 1 ]; then
+        if [ -e "/sys/bus/pci/devices/$audio_bdf/driver/unbind" ]; then
+            echo "$audio_bdf" > "/sys/bus/pci/devices/$audio_bdf/driver/unbind" 2>/dev/null \
+                && log "$audio_bdf audio unbound"
+        fi
+        log "$bdf unbinding amdgpu (screen goes dark here)"
+        echo "$bdf" > /sys/bus/pci/drivers/amdgpu/unbind 2>/dev/null && log "$bdf unbound"
+
+        if [ "$RESET_ON_POWEROFF" = 1 ] && [ ! -e "$pdev/driver" ] && [ -w "$pdev/reset" ]; then
+            log "$bdf bus reset"
+            echo 1 > "$pdev/reset" 2>/dev/null && log "$bdf reset done"
+        fi
+    fi
+done
+log "hook finished, handing over to kernel power-off"
+exit 0
