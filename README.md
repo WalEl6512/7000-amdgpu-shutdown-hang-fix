@@ -1,4 +1,6 @@
 # amdgpu-power-fix
+## Disclaimer!!!
+### This solution is entirely AI generated. After months of trying my patience to fix this on my own faded.
 
 Fixes the **power-off hang on AMD Radeon RX 7900 XT/XTX (Navi 31)** under Linux.
 
